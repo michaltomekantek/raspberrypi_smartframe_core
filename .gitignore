@@ -1,0 +1,65 @@
+# ---> General Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# virtual env
+venv/
+.venv/
+env/
+ENV/
+
+# PyInstaller
+*.spec
+
+# Logs
+*.log
+logs/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+*.icns
+
+# FastAPI / Uvicorn
+uvicorn.log
+
+# Uploaded images (save only if needed)
+received/
+display/
+uploads/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.webp
+
+# Cache
+.cache/
+pytest_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+
+# Local config
+config.local.json
+.env
+*.env
+
+# Raspberry Pi specific
+*.so
