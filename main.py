@@ -32,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="4.0.0")
+app = FastAPI(title="SmartFrame OS", version="4.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -41,9 +41,7 @@ args = parser.parse_args()
 
 IS_MAC = (args.mode == "mac")
 UPLOAD_DIR = "uploaded"
-
-# Podstaw swoje aktualne IP jeśli się zmieniło
-BASE_URL = "http://192.168.0.194/images/"
+BASE_URL = "http://192.168.0.194/images/" # Upewnij się, że to Twój aktualny adres IP
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -51,8 +49,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 dashboard_active = False
 slideshow_running = False
 global_interval = 10
-# Optymalizacja pod Waveshare 7'' C
-SCREEN_W, SCREEN_H = (1024, 600)
+SCREEN_W, SCREEN_H = (1024, 600) # Rozdzielczość Waveshare 7''
 skip_requested = False
 
 def get_db():
@@ -85,7 +82,7 @@ def draw_card(draw, x, y, w, h, label, value, unit, color):
     draw.rectangle([x, y+15, x+8, y+h-15], fill=color)
     try:
         font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        f_val = ImageFont.truetype(font_path, 45) # Większe fonty pod 1024px
+        f_val = ImageFont.truetype(font_path, 45)
         f_lbl = ImageFont.truetype(font_path, 18)
     except:
         f_val = ImageFont.load_default(); f_lbl = ImageFont.load_default()
@@ -94,24 +91,36 @@ def draw_card(draw, x, y, w, h, label, value, unit, color):
 
 def create_dashboard_image():
     data = get_sys_data()
-    # Głęboka czerń dla matrycy IPS
     img = Image.new('RGB', (SCREEN_W, SCREEN_H), color=(10, 11, 13))
     draw = ImageDraw.Draw(img)
+
+    # Przesunięcie wszystkiego w górę, aby uniknąć ucinania dołu
+    y_offset = -30
+
     try:
         font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        f_time = ImageFont.truetype(font_path, 110); f_date = ImageFont.truetype(font_path, 40)
+        f_time = ImageFont.truetype(font_path, 110)
+        f_date = ImageFont.truetype(font_path, 40)
     except:
         f_time = ImageFont.load_default(); f_date = ImageFont.load_default()
 
-    draw.text((60, 50), data["time"], fill=(97, 175, 239), font=f_time)
-    draw.text((60, 170), data["date"], fill=(152, 195, 121), font=f_date)
+    # Czas i Data
+    draw.text((60, 60 + y_offset), data["time"], fill=(97, 175, 239), font=f_time)
+    draw.text((60, 175 + y_offset), data["date"], fill=(152, 195, 121), font=f_date)
 
-    card_w, card_h = 280, 140
-    draw_card(draw, 60,  260, card_w, card_h, "CPU USAGE", data["cpu"], "%", (224, 108, 117))
-    draw_card(draw, 370, 260, card_w, card_h, "CPU TEMP", data["temp"], "°C", (209, 154, 102))
-    draw_card(draw, 680, 260, card_w, card_h, "RAM LOAD", data["ram"], "%", (198, 120, 221))
-    draw_card(draw, 60,  430, card_w, card_h, "DISK USED", data["storage"], "%", (86, 182, 194))
-    draw.text((680, 540), f"IP: {data['ip']}", fill=(92, 99, 112))
+    # Karty statystyk
+    card_w, card_h = 280, 135
+    row1_y = 260 + y_offset
+    row2_y = 415 + y_offset
+
+    draw_card(draw, 60,  row1_y, card_w, card_h, "CPU USAGE", data["cpu"], "%", (224, 108, 117))
+    draw_card(draw, 370, row1_y, card_w, card_h, "CPU TEMP", data["temp"], "°C", (209, 154, 102))
+    draw_card(draw, 680, row1_y, card_w, card_h, "RAM LOAD", data["ram"], "%", (198, 120, 221))
+
+    draw_card(draw, 60,  row2_y, card_w, card_h, "DISK USED", data["storage"], "%", (86, 182, 194))
+
+    # IP info (prawy dolny róg)
+    draw.text((680, 550 + y_offset), f"IP: {data['ip']}", fill=(92, 99, 112))
 
     path = os.path.abspath("current_ui.png")
     img.save(path)
@@ -140,7 +149,7 @@ def render_to_pygame(path, screen_obj):
     except Exception as e:
         print(f"Blad renderowania: {e}")
 
-# --- GŁÓWNA PĘTLA WYŚWIETLANIA Z OBSŁUGĄ DOTYKU ---
+# --- GŁÓWNA PĘTLA WYŚWIETLANIA ---
 
 def global_display_loop():
     global dashboard_active, slideshow_running, global_interval, skip_requested
@@ -150,19 +159,17 @@ def global_display_loop():
         try:
             import pygame
             pygame.init()
-            # Ustawiamy natywną rozdzielczość Twojego Waveshare
-            local_screen = pygame.display.set_mode((1024, 600), pygame.FULLSCREEN)
+            # NOFRAME + FULLSCREEN zapobiega przesunięciom przez system operacyjny
+            local_screen = pygame.display.set_mode((1024, 600), pygame.FULLSCREEN | pygame.NOFRAME)
             pygame.mouse.set_visible(False)
         except Exception as e:
             print(f"Blad Pygame: {e}")
 
     while True:
-        # Obsługa zdarzeń Pygame (Dotyk/Mysz)
         if local_screen:
             import pygame
             for event in pygame.event.get():
                 if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
-                    # Dotknięcie ekranu wymusza następne zdjęcie
                     skip_requested = True
 
         if dashboard_active:
@@ -186,18 +193,16 @@ def global_display_loop():
                         if local_screen:
                             render_to_pygame(path, local_screen)
 
-                        # Czekanie na interwał lub dotyk
                         start_wait = time.time()
                         while time.time() - start_wait < global_interval:
                             if skip_requested or not slideshow_running or dashboard_active:
                                 break
                             time.sleep(0.1)
-                            # Ponowne sprawdzenie dotyku w pętli czekania
                             for event in pygame.event.get():
                                 if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
                                     skip_requested = True
 
-                        skip_requested = False # Reset flagi po zmianie zdjęcia
+                        skip_requested = False
             else:
                 time.sleep(2)
         else:
@@ -205,7 +210,7 @@ def global_display_loop():
 
 threading.Thread(target=global_display_loop, daemon=True).start()
 
-# --- ENDPOINTY ---
+# --- ENDPOINTY API ---
 
 @app.post("/upload", tags=["Library"])
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -222,11 +227,9 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
         f.write(content)
 
     os.chmod(final_path, 0o644)
-
     new_img.filename = new_filename
     new_img.url = f"{BASE_URL}{new_filename}"
     db.commit()
-    db.refresh(new_img)
     return new_img
 
 @app.get("/show-stats", tags=["Display Control"])
