@@ -32,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="4.1.0")
+app = FastAPI(title="SmartFrame OS", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -41,7 +41,7 @@ args = parser.parse_args()
 
 IS_MAC = (args.mode == "mac")
 UPLOAD_DIR = "uploaded"
-BASE_URL = "http://192.168.0.194/images/" # Upewnij się, że to Twój aktualny adres IP
+BASE_URL = "http://192.168.0.194/images/"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -49,7 +49,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 dashboard_active = False
 slideshow_running = False
 global_interval = 10
-SCREEN_W, SCREEN_H = (1024, 600) # Rozdzielczość Waveshare 7''
+SCREEN_W, SCREEN_H = (1024, 600)
 skip_requested = False
 
 def get_db():
@@ -68,8 +68,9 @@ def get_sys_data():
                 temp = round(float(f.read()) / 1000.0, 1)
         except: pass
     return {
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "date": datetime.now().strftime("%d.%m.%Y"),
+        "time": datetime.now().strftime("%H:%M"),
+        "seconds": datetime.now().strftime(":%S"),
+        "date": datetime.now().strftime("%A, %d %B %Y").upper(),
         "cpu": psutil.cpu_percent(),
         "temp": temp or "--",
         "ram": ram.percent,
@@ -78,49 +79,69 @@ def get_sys_data():
     }
 
 def draw_card(draw, x, y, w, h, label, value, unit, color):
-    draw.rounded_rectangle([x, y, x+w, y+h], radius=20, fill=(28, 30, 35))
-    draw.rectangle([x, y+15, x+8, y+h-15], fill=color)
+    # Tło karty z lekkim połyskiem
+    draw.rounded_rectangle([x, y, x+w, y+h], radius=15, fill=(33, 37, 43))
+    # Akcent boczny (grubszy, bardziej nasycony)
+    draw.rounded_rectangle([x, y, x+12, y+h], radius=5, fill=color)
+
     try:
         font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        f_val = ImageFont.truetype(font_path, 45)
-        f_lbl = ImageFont.truetype(font_path, 18)
+        f_val = ImageFont.truetype(font_path, 50)
+        f_lbl = ImageFont.truetype(font_path, 20)
     except:
         f_val = ImageFont.load_default(); f_lbl = ImageFont.load_default()
-    draw.text((x+30, y+20), label, fill=(171, 178, 191), font=f_lbl)
-    draw.text((x+30, y+50), f"{value}{unit}", fill=(255, 255, 255), font=f_val)
+
+    draw.text((x+35, y+25), label, fill=(155, 160, 170), font=f_lbl)
+    draw.text((x+35, y+55), f"{value}", fill=(255, 255, 255), font=f_val)
+    # Jednostka mniejszym drukiem obok wartości
+    val_w = draw.textlength(f"{value}", font=f_val)
+    draw.text((x+35+val_w+5, y+75), unit, fill=color, font=f_lbl)
 
 def create_dashboard_image():
     data = get_sys_data()
-    img = Image.new('RGB', (SCREEN_W, SCREEN_H), color=(10, 11, 13))
+    # Tło: Bardzo ciemny granat/czerń
+    img = Image.new('RGB', (SCREEN_W, SCREEN_H), color=(18, 20, 24))
     draw = ImageDraw.Draw(img)
 
-    # Przesunięcie wszystkiego w górę, aby uniknąć ucinania dołu
-    y_offset = -30
+    y_offset = -20
 
     try:
         font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        f_time = ImageFont.truetype(font_path, 110)
-        f_date = ImageFont.truetype(font_path, 40)
+        f_time = ImageFont.truetype(font_path, 130)
+        f_sec = ImageFont.truetype(font_path, 60)
+        f_date = ImageFont.truetype(font_path, 32)
+        f_ip = ImageFont.truetype(font_path, 18)
     except:
-        f_time = ImageFont.load_default(); f_date = ImageFont.load_default()
+        f_time = ImageFont.load_default(); f_sec = ImageFont.load_default(); f_date = ImageFont.load_default(); f_ip = ImageFont.load_default()
 
-    # Czas i Data
-    draw.text((60, 60 + y_offset), data["time"], fill=(97, 175, 239), font=f_time)
-    draw.text((60, 175 + y_offset), data["date"], fill=(152, 195, 121), font=f_date)
+    # Zegar z wyróżnionymi sekundami
+    time_w = draw.textlength(data["time"], font=f_time)
+    draw.text((60, 50 + y_offset), data["time"], fill=(255, 255, 255), font=f_time)
+    draw.text((60 + time_w + 5, 105 + y_offset), data["seconds"], fill=(97, 175, 239), font=f_sec)
+
+    # Data pod zegarem
+    draw.text((65, 185 + y_offset), data["date"], fill=(152, 195, 121), font=f_date)
+
+    # Definicja kolorów One Dark
+    COLOR_RED = (224, 108, 117)
+    COLOR_ORANGE = (209, 154, 102)
+    COLOR_PURPLE = (198, 120, 221)
+    COLOR_CYAN = (86, 182, 194)
 
     # Karty statystyk
-    card_w, card_h = 280, 135
-    row1_y = 260 + y_offset
-    row2_y = 415 + y_offset
+    card_w, card_h = 285, 140
+    row1_y = 270 + y_offset
+    row2_y = 430 + y_offset
 
-    draw_card(draw, 60,  row1_y, card_w, card_h, "CPU USAGE", data["cpu"], "%", (224, 108, 117))
-    draw_card(draw, 370, row1_y, card_w, card_h, "CPU TEMP", data["temp"], "°C", (209, 154, 102))
-    draw_card(draw, 680, row1_y, card_w, card_h, "RAM LOAD", data["ram"], "%", (198, 120, 221))
+    draw_card(draw, 60,  row1_y, card_w, card_h, "PROCESOR", data["cpu"], "%", COLOR_RED)
+    draw_card(draw, 370, row1_y, card_w, card_h, "TERMAL", data["temp"], "°C", COLOR_ORANGE)
+    draw_card(draw, 680, row1_y, card_w, card_h, "PAMIĘĆ RAM", data["ram"], "%", COLOR_PURPLE)
 
-    draw_card(draw, 60,  row2_y, card_w, card_h, "DISK USED", data["storage"], "%", (86, 182, 194))
+    draw_card(draw, 60,  row2_y, card_w, card_h, "DYSK SYSTEM", data["storage"], "%", COLOR_CYAN)
 
-    # IP info (prawy dolny róg)
-    draw.text((680, 550 + y_offset), f"IP: {data['ip']}", fill=(92, 99, 112))
+    # Stopka z IP
+    draw.rectangle([680, 560+y_offset, 965, 562+y_offset], fill=(45, 50, 60))
+    draw.text((680, 570 + y_offset), f"NETWORK ADDRESS: {data['ip']}", fill=(92, 99, 112), font=f_ip)
 
     path = os.path.abspath("current_ui.png")
     img.save(path)
@@ -130,21 +151,8 @@ def render_to_pygame(path, screen_obj):
     import pygame
     try:
         img_pil = Image.open(path).convert("RGB")
-        img_w, img_h = img_pil.size
-        sw, sh = screen_obj.get_size()
-
-        ratio = min(sw / img_w, sh / img_h)
-        new_w = int(img_w * ratio)
-        new_h = int(img_h * ratio)
-
         surf = pygame.image.fromstring(img_pil.tobytes(), img_pil.size, "RGB")
-        scaled_surf = pygame.transform.smoothscale(surf, (new_w, new_h))
-
-        screen_obj.fill((0, 0, 0))
-        offset_x = (sw - new_w) // 2
-        offset_y = (sh - new_h) // 2
-
-        screen_obj.blit(scaled_surf, (offset_x, offset_y))
+        screen_obj.blit(surf, (0, 0))
         pygame.display.update()
     except Exception as e:
         print(f"Blad renderowania: {e}")
@@ -159,7 +167,6 @@ def global_display_loop():
         try:
             import pygame
             pygame.init()
-            # NOFRAME + FULLSCREEN zapobiega przesunięciom przez system operacyjny
             local_screen = pygame.display.set_mode((1024, 600), pygame.FULLSCREEN | pygame.NOFRAME)
             pygame.mouse.set_visible(False)
         except Exception as e:
@@ -201,7 +208,6 @@ def global_display_loop():
                             for event in pygame.event.get():
                                 if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
                                     skip_requested = True
-
                         skip_requested = False
             else:
                 time.sleep(2)
@@ -210,7 +216,7 @@ def global_display_loop():
 
 threading.Thread(target=global_display_loop, daemon=True).start()
 
-# --- ENDPOINTY API ---
+# --- API ENDPOINTS (BEZ ZMIAN) ---
 
 @app.post("/upload", tags=["Library"])
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -221,11 +227,8 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     db.refresh(new_img)
     new_filename = f"{new_img.id}{ext}"
     final_path = os.path.join(UPLOAD_DIR, new_filename)
-
     content = await file.read()
-    with open(final_path, "wb") as f:
-        f.write(content)
-
+    with open(final_path, "wb") as f: f.write(content)
     os.chmod(final_path, 0o644)
     new_img.filename = new_filename
     new_img.url = f"{BASE_URL}{new_filename}"
