@@ -32,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="3.4.0")
+app = FastAPI(title="SmartFrame OS", version="3.4.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -112,7 +112,6 @@ def create_dashboard_image():
     return path
 
 def render_to_pygame(path, screen_obj):
-    """Pomocnicza funkcja do rysowania w wątku Pygame."""
     import pygame
     img = Image.open(path).convert("RGB")
     surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
@@ -125,18 +124,16 @@ def render_to_pygame(path, screen_obj):
 
 def global_display_loop():
     global dashboard_active, slideshow_running, global_interval
-
     local_screen = None
     if not IS_MAC:
         try:
             import pygame
             pygame.init()
-            # Inicjalizacja ekranu W TYM SAMYM WĄTKU co renderowanie (zapobiega EGL_BAD_ACCESS)
             info = pygame.display.Info()
             local_screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
             pygame.mouse.set_visible(False)
         except Exception as e:
-            print(f"Błąd inicjalizacji Pygame: {e}")
+            print(f"Blad Pygame: {e}")
 
     while True:
         if dashboard_active:
@@ -146,12 +143,10 @@ def global_display_loop():
             elif local_screen:
                 render_to_pygame(path, local_screen)
             time.sleep(2 if IS_MAC else 1)
-
         elif slideshow_running:
             db = SessionLocal()
             active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
             db.close()
-
             if active_images:
                 for img in active_images:
                     if not slideshow_running or dashboard_active: break
@@ -167,7 +162,6 @@ def global_display_loop():
         else:
             time.sleep(1)
 
-# Uruchomienie pętli w osobnym wątku
 threading.Thread(target=global_display_loop, daemon=True).start()
 
 # --- ENDPOINTY ---
@@ -179,14 +173,11 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     db.add(new_img)
     db.commit()
     db.refresh(new_img)
-
     new_filename = f"{new_img.id}{ext}"
     final_path = os.path.join(UPLOAD_DIR, new_filename)
-
     content = await file.read()
     with open(final_path, "wb") as f:
         f.write(content)
-
     new_img.filename = new_filename
     new_img.url = f"{BASE_URL}{new_filename}"
     db.commit()
@@ -230,4 +221,14 @@ def toggle_image(image_id: int, is_active: bool, db: Session = Depends(get_db)):
     return img
 
 @app.delete("/images/{image_id}", tags=["Library"])
-def delete_image(image_
+def delete_image(image_id: int, db: Session = Depends(get_db)):
+    img = db.query(ImageModel).filter(ImageModel.id == image_id).first()
+    if not img: raise HTTPException(status_code=404)
+    file_path = os.path.join(UPLOAD_DIR, img.filename)
+    if os.path.exists(file_path): os.remove(file_path)
+    db.delete(img)
+    db.commit()
+    return {"status": "deleted", "id": image_id}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
