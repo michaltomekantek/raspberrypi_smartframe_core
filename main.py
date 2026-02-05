@@ -12,8 +12,7 @@ import psutil
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from PIL import Image, ImageDraw, ImageFont
 
 # --- KONFIGURACJA BAZY ---
@@ -33,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="3.3.0")
+app = FastAPI(title="SmartFrame OS", version="3.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -51,20 +50,12 @@ slideshow_running = False
 global_interval = 10
 SCREEN_W, SCREEN_H = (800, 480)
 
-if not IS_MAC:
-    import pygame
-    pygame.init()
-    info = pygame.display.Info()
-    SCREEN_W, SCREEN_H = info.current_w, info.current_h
-    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
-    pygame.mouse.set_visible(False)
-
 def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
 
-# --- LOGIKA SYSTEMOWA I RYSOWANIE (Dashboard) ---
+# --- LOGIKA SYSTEMOWA I RYSOWANIE ---
 
 def get_sys_data():
     ram = psutil.virtual_memory()
@@ -120,72 +111,86 @@ def create_dashboard_image():
     img.save(path)
     return path
 
-def display_on_screen(path):
-    if IS_MAC:
-        subprocess.run(["open", "-g", "-a", "Preview", path])
-    else:
-        img = Image.open(path).convert("RGB")
-        surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
-        surf = pygame.transform.scale(surf, (SCREEN_W, SCREEN_H))
-        screen.blit(surf, (0, 0))
-        pygame.display.update()
+def render_to_pygame(path, screen_obj):
+    """Pomocnicza funkcja do rysowania w wątku Pygame."""
+    import pygame
+    img = Image.open(path).convert("RGB")
+    surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
+    sw, sh = screen_obj.get_size()
+    surf = pygame.transform.scale(surf, (sw, sh))
+    screen_obj.blit(surf, (0, 0))
+    pygame.display.update()
 
 # --- GŁÓWNA PĘTLA WYŚWIETLANIA ---
 
 def global_display_loop():
     global dashboard_active, slideshow_running, global_interval
+
+    local_screen = None
+    if not IS_MAC:
+        try:
+            import pygame
+            pygame.init()
+            # Inicjalizacja ekranu W TYM SAMYM WĄTKU co renderowanie (zapobiega EGL_BAD_ACCESS)
+            info = pygame.display.Info()
+            local_screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
+            pygame.mouse.set_visible(False)
+        except Exception as e:
+            print(f"Błąd inicjalizacji Pygame: {e}")
+
     while True:
         if dashboard_active:
             path = create_dashboard_image()
-            display_on_screen(path)
+            if IS_MAC:
+                subprocess.run(["open", "-g", "-a", "Preview", path])
+            elif local_screen:
+                render_to_pygame(path, local_screen)
             time.sleep(2 if IS_MAC else 1)
+
         elif slideshow_running:
             db = SessionLocal()
             active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
             db.close()
+
             if active_images:
                 for img in active_images:
                     if not slideshow_running or dashboard_active: break
                     path = os.path.abspath(os.path.join(UPLOAD_DIR, img.filename))
                     if os.path.exists(path):
-                        display_on_screen(path)
+                        if IS_MAC:
+                            subprocess.run(["open", "-g", "-a", "Preview", path])
+                        elif local_screen:
+                            render_to_pygame(path, local_screen)
                         time.sleep(global_interval)
             else:
                 time.sleep(2)
         else:
             time.sleep(1)
 
+# Uruchomienie pętli w osobnym wątku
 threading.Thread(target=global_display_loop, daemon=True).start()
 
 # --- ENDPOINTY ---
 
 @app.post("/upload", tags=["Library"])
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Wgrywa zdjęcie, nadaje mu nazwę ID i zapisuje unikalny URL."""
-    # 1. Pobierz rozszerzenie (np. .jpg, .png)
     ext = os.path.splitext(file.filename)[1].lower()
-
-    # 2. Utwórz tymczasowy wpis w bazie, aby zarezerwować ID
     new_img = ImageModel(filename="temp", url="temp")
     db.add(new_img)
     db.commit()
     db.refresh(new_img)
 
-    # 3. Wygeneruj nową nazwę na podstawie ID
     new_filename = f"{new_img.id}{ext}"
     final_path = os.path.join(UPLOAD_DIR, new_filename)
 
-    # 4. Zapisz plik na dysku pod nową nazwą
     content = await file.read()
     with open(final_path, "wb") as f:
         f.write(content)
 
-    # 5. Zaktualizuj rekord w bazie o prawdziwe dane
     new_img.filename = new_filename
     new_img.url = f"{BASE_URL}{new_filename}"
     db.commit()
     db.refresh(new_img)
-
     return new_img
 
 @app.get("/show-stats", tags=["Display Control"])
@@ -225,14 +230,4 @@ def toggle_image(image_id: int, is_active: bool, db: Session = Depends(get_db)):
     return img
 
 @app.delete("/images/{image_id}", tags=["Library"])
-def delete_image(image_id: int, db: Session = Depends(get_db)):
-    img = db.query(ImageModel).filter(ImageModel.id == image_id).first()
-    if not img: raise HTTPException(status_code=404)
-    file_path = os.path.join(UPLOAD_DIR, img.filename)
-    if os.path.exists(file_path): os.remove(file_path)
-    db.delete(img)
-    db.commit()
-    return {"status": "deleted", "id": image_id}
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def delete_image(image_
