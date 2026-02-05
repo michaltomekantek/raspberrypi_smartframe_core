@@ -32,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="3.4.2")
+app = FastAPI(title="SmartFrame OS", version="3.4.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -42,7 +42,6 @@ args = parser.parse_args()
 IS_MAC = (args.mode == "mac")
 UPLOAD_DIR = "uploaded"
 
-# ZMIANA: BASE_URL teraz celuje w Nginxa (port 80), a nie FastAPI (8000)
 # Jeśli Twoje IP się zmieniło, podstaw aktualne.
 BASE_URL = "http://192.168.0.194/images/"
 
@@ -115,14 +114,36 @@ def create_dashboard_image():
     img.save(path)
     return path
 
+# --- POPRAWIONA FUNKCJA RENDEROWANIA (BEZ ROZCIĄGANIA) ---
+
 def render_to_pygame(path, screen_obj):
     import pygame
-    img = Image.open(path).convert("RGB")
-    surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
-    sw, sh = screen_obj.get_size()
-    surf = pygame.transform.scale(surf, (sw, sh))
-    screen_obj.blit(surf, (0, 0))
-    pygame.display.update()
+    try:
+        # Ładowanie PILa do konwersji
+        img_pil = Image.open(path).convert("RGB")
+        img_w, img_h = img_pil.size
+        sw, sh = screen_obj.get_size()
+
+        # Obliczanie proporcji Aspect Fit
+        ratio = min(sw / img_w, sh / img_h)
+        new_w = int(img_w * ratio)
+        new_h = int(img_h * ratio)
+
+        # Konwersja na powierzchnię Pygame
+        surf = pygame.image.fromstring(img_pil.tobytes(), img_pil.size, "RGB")
+
+        # Skalowanie płynne (nie rozciąga!)
+        scaled_surf = pygame.transform.smoothscale(surf, (new_w, new_h))
+
+        # Centrowanie na czarnym tle
+        screen_obj.fill((0, 0, 0))
+        offset_x = (sw - new_w) // 2
+        offset_y = (sh - new_h) // 2
+
+        screen_obj.blit(scaled_surf, (offset_x, offset_y))
+        pygame.display.update()
+    except Exception as e:
+        print(f"Błąd renderowania obrazu {path}: {e}")
 
 # --- GŁÓWNA PĘTLA WYŚWIETLANIA ---
 
@@ -133,6 +154,7 @@ def global_display_loop():
         try:
             import pygame
             pygame.init()
+            # Pobieramy info o ekranie dla pełnego wymiaru
             info = pygame.display.Info()
             local_screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN)
             pygame.mouse.set_visible(False)
@@ -184,7 +206,6 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     with open(final_path, "wb") as f:
         f.write(content)
 
-    # POPRAWKA: Nadanie uprawnień odczytu (644), aby Nginx widział nowe zdjęcia
     os.chmod(final_path, 0o644)
 
     new_img.filename = new_filename
