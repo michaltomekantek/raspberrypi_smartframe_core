@@ -32,7 +32,7 @@ class ImageModel(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="3.4.1")
+app = FastAPI(title="SmartFrame OS", version="3.4.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 parser = argparse.ArgumentParser()
@@ -41,7 +41,11 @@ args = parser.parse_args()
 
 IS_MAC = (args.mode == "mac")
 UPLOAD_DIR = "uploaded"
-BASE_URL = "http://localhost:8000/images/"
+
+# ZMIANA: BASE_URL teraz celuje w Nginxa (port 80), a nie FastAPI (8000)
+# Jeśli Twoje IP się zmieniło, podstaw aktualne.
+BASE_URL = "http://192.168.0.194/images/"
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- ZMIENNE GLOBALNE ---
@@ -175,9 +179,14 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     db.refresh(new_img)
     new_filename = f"{new_img.id}{ext}"
     final_path = os.path.join(UPLOAD_DIR, new_filename)
+
     content = await file.read()
     with open(final_path, "wb") as f:
         f.write(content)
+
+    # POPRAWKA: Nadanie uprawnień odczytu (644), aby Nginx widział nowe zdjęcia
+    os.chmod(final_path, 0o644)
+
     new_img.filename = new_filename
     new_img.url = f"{BASE_URL}{new_filename}"
     db.commit()
