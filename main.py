@@ -2,30 +2,54 @@ import argparse
 import os
 import subprocess
 import socket
-import platform
 import time
 import threading
 from datetime import datetime
+from typing import List, Optional
 
 import uvicorn
 import psutil
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 from PIL import Image, ImageDraw, ImageFont
 
-# --- KONFIGURACJA ---
+# --- KONFIGURACJA BAZY ---
+DATABASE_URL = "sqlite:///./smartframe.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class ImageModel(Base):
+    __tablename__ = "images"
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String)
+    url = Column(String)
+    added_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+Base.metadata.create_all(bind=engine)
+
+# --- KONFIGURACJA APKI ---
+app = FastAPI(title="SmartFrame OS", version="3.3.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 parser = argparse.ArgumentParser()
 parser.add_argument("mode", nargs="?", default="pi", choices=["pi", "mac"])
 args = parser.parse_args()
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
 IS_MAC = (args.mode == "mac")
-SCREEN_W, SCREEN_H = (800, 480)
+UPLOAD_DIR = "uploaded"
+BASE_URL = "http://localhost:8000/images/"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# FLAGI STERUJĄCE
-dashboard_active = False # Domyślnie wyłączone, włącza endpoint /show-stats
+# --- ZMIENNE GLOBALNE ---
+dashboard_active = False
+slideshow_running = False
+global_interval = 10
+SCREEN_W, SCREEN_H = (800, 480)
 
 if not IS_MAC:
     import pygame
@@ -35,7 +59,12 @@ if not IS_MAC:
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
     pygame.mouse.set_visible(False)
 
-# --- LOGIKA SYSTEMOWA ---
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+# --- LOGIKA SYSTEMOWA I RYSOWANIE (Dashboard) ---
 
 def get_sys_data():
     ram = psutil.virtual_memory()
@@ -45,7 +74,6 @@ def get_sys_data():
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                 temp = round(float(f.read()) / 1000.0, 1)
         except: pass
-
     return {
         "time": datetime.now().strftime("%H:%M:%S"),
         "date": datetime.now().strftime("%d.%m.%Y"),
@@ -60,8 +88,9 @@ def draw_card(draw, x, y, w, h, label, value, unit, color):
     draw.rounded_rectangle([x, y, x+w, y+h], radius=15, fill=(40, 44, 52))
     draw.rectangle([x, y+10, x+5, y+h-10], fill=color)
     try:
-        f_val = ImageFont.truetype("Arial.ttf", 35)
-        f_lbl = ImageFont.truetype("Arial.ttf", 15)
+        font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        f_val = ImageFont.truetype(font_path, 35)
+        f_lbl = ImageFont.truetype(font_path, 15)
     except:
         f_val = ImageFont.load_default(); f_lbl = ImageFont.load_default()
     draw.text((x+20, y+15), label, fill=(171, 178, 191), font=f_lbl)
@@ -72,8 +101,8 @@ def create_dashboard_image():
     img = Image.new('RGB', (SCREEN_W, SCREEN_H), color=(33, 37, 43))
     draw = ImageDraw.Draw(img)
     try:
-        f_time = ImageFont.truetype("Arial.ttf", 80)
-        f_date = ImageFont.truetype("Arial.ttf", 30)
+        font_path = "/Library/Fonts/Arial.ttf" if IS_MAC else "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        f_time = ImageFont.truetype(font_path, 80); f_date = ImageFont.truetype(font_path, 30)
     except:
         f_time = ImageFont.load_default(); f_date = ImageFont.load_default()
 
@@ -87,68 +116,123 @@ def create_dashboard_image():
     draw_card(draw, 40,  330, card_w, card_h, "DISK USED", data["storage"], "%", (86, 182, 194))
     draw.text((520, 440), f"IP: {data['ip']}", fill=(92, 99, 112))
 
-    path = "current_ui.png"
+    path = os.path.abspath("current_ui.png")
     img.save(path)
     return path
 
-# --- PĘTLA WYŚWIETLANIA (BACKGROUND THREAD) ---
-
-def ui_loop():
-    global dashboard_active
-    while True:
-        if dashboard_active:
-            path = create_dashboard_image()
-            if not IS_MAC:
-                img = Image.open(path).convert("RGB")
-                surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
-                surf = pygame.transform.scale(surf, (SCREEN_W, SCREEN_H))
-                screen.blit(surf, (0, 0))
-                pygame.display.update()
-            # Na macu w trybie loop nie otwieramy okna (tylko generujemy plik)
-        time.sleep(1)
-
-threading.Thread(target=ui_loop, daemon=True).start()
-
-# --- ENDPOINTY ---
-
-@app.get("/show-stats")
-async def show_stats():
-    global dashboard_active
-    dashboard_active = True  # Włączamy odświeżanie w tle
-
-    path = create_dashboard_image()
+def display_on_screen(path):
     if IS_MAC:
-        # Na Macu wymuszamy otwarcie podglądu raz
-        subprocess.run(["open", path])
-
-    return {"status": "Dashboard mode activated (Live refresh ON)"}
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    global dashboard_active
-    dashboard_active = False  # WYŁĄCZAMY odświeżanie dashboardu
-
-    os.makedirs("uploaded", exist_ok=True)
-    path = os.path.join("uploaded", file.filename)
-    content = await file.read()
-    with open(path, "wb") as f:
-        f.write(content)
-
-    # Wyświetlamy wgrane zdjęcie
-    if not IS_MAC:
+        subprocess.run(["open", "-g", "-a", "Preview", path])
+    else:
         img = Image.open(path).convert("RGB")
         surf = pygame.image.fromstring(img.tobytes(), img.size, "RGB")
         surf = pygame.transform.scale(surf, (SCREEN_W, SCREEN_H))
         screen.blit(surf, (0, 0))
         pygame.display.update()
-    else:
-        subprocess.run(["open", path])
 
-    return {"status": "Image displayed, dashboard deactivated"}
+# --- GŁÓWNA PĘTLA WYŚWIETLANIA ---
 
-@app.get("/system-info")
-def get_info():
-    return get_sys_data()
+def global_display_loop():
+    global dashboard_active, slideshow_running, global_interval
+    while True:
+        if dashboard_active:
+            path = create_dashboard_image()
+            display_on_screen(path)
+            time.sleep(2 if IS_MAC else 1)
+        elif slideshow_running:
+            db = SessionLocal()
+            active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
+            db.close()
+            if active_images:
+                for img in active_images:
+                    if not slideshow_running or dashboard_active: break
+                    path = os.path.abspath(os.path.join(UPLOAD_DIR, img.filename))
+                    if os.path.exists(path):
+                        display_on_screen(path)
+                        time.sleep(global_interval)
+            else:
+                time.sleep(2)
+        else:
+            time.sleep(1)
+
+threading.Thread(target=global_display_loop, daemon=True).start()
+
+# --- ENDPOINTY ---
+
+@app.post("/upload", tags=["Library"])
+async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Wgrywa zdjęcie, nadaje mu nazwę ID i zapisuje unikalny URL."""
+    # 1. Pobierz rozszerzenie (np. .jpg, .png)
+    ext = os.path.splitext(file.filename)[1].lower()
+
+    # 2. Utwórz tymczasowy wpis w bazie, aby zarezerwować ID
+    new_img = ImageModel(filename="temp", url="temp")
+    db.add(new_img)
+    db.commit()
+    db.refresh(new_img)
+
+    # 3. Wygeneruj nową nazwę na podstawie ID
+    new_filename = f"{new_img.id}{ext}"
+    final_path = os.path.join(UPLOAD_DIR, new_filename)
+
+    # 4. Zapisz plik na dysku pod nową nazwą
+    content = await file.read()
+    with open(final_path, "wb") as f:
+        f.write(content)
+
+    # 5. Zaktualizuj rekord w bazie o prawdziwe dane
+    new_img.filename = new_filename
+    new_img.url = f"{BASE_URL}{new_filename}"
+    db.commit()
+    db.refresh(new_img)
+
+    return new_img
+
+@app.get("/show-stats", tags=["Display Control"])
+def show_stats():
+    global dashboard_active, slideshow_running
+    slideshow_running = False; dashboard_active = True
+    return {"status": "Stats mode active"}
+
+@app.get("/start-slideshow", tags=["Display Control"])
+def start_slideshow():
+    global dashboard_active, slideshow_running
+    dashboard_active = False; slideshow_running = True
+    return {"status": "Slideshow started"}
+
+@app.get("/stop-all", tags=["Display Control"])
+def stop_all():
+    global dashboard_active, slideshow_running
+    dashboard_active = False; slideshow_running = False
+    return {"status": "Display stopped"}
+
+@app.post("/settings/interval", tags=["Settings"])
+def set_interval(seconds: int):
+    global global_interval
+    global_interval = seconds
+    return {"global_interval": global_interval}
+
+@app.get("/images", tags=["Library"])
+def get_images(db: Session = Depends(get_db)):
+    return db.query(ImageModel).all()
+
+@app.patch("/images/{image_id}", tags=["Library"])
+def toggle_image(image_id: int, is_active: bool, db: Session = Depends(get_db)):
+    img = db.query(ImageModel).filter(ImageModel.id == image_id).first()
+    if not img: raise HTTPException(status_code=404)
+    img.is_active = is_active
+    db.commit()
+    return img
+
+@app.delete("/images/{image_id}", tags=["Library"])
+def delete_image(image_id: int, db: Session = Depends(get_db)):
+    img = db.query(ImageModel).filter(ImageModel.id == image_id).first()
+    if not img: raise HTTPException(status_code=404)
+    file_path = os.path.join(UPLOAD_DIR, img.filename)
+    if os.path.exists(file_path): os.remove(file_path)
+    db.delete(img)
+    db.commit()
+    return {"status": "deleted", "id": image_id}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
