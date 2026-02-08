@@ -4,7 +4,7 @@ import io
 import time
 from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import Session
 
@@ -27,10 +27,8 @@ except ImportError:
 
 epaper_router = APIRouter(tags=["E-Paper Control"])
 
-# --- NOWE ŚCIEŻKI ZGODNE Z TWOIM POMYSŁEM ---
-# Folder fizyczny to podfolder w 'uploaded'
+# Ścieżki
 UPLOAD_EPAPER_DIR = os.path.join("uploaded", "epaper")
-# URL to podfolder w '/images/'
 BASE_URL = "http://192.168.0.194/images/epaper/"
 
 os.makedirs(UPLOAD_EPAPER_DIR, exist_ok=True)
@@ -42,9 +40,14 @@ epaper_interval = 600.0
 slideshow_running = False
 force_refresh_event = threading.Event()
 
-def draw_image_task(img_path: str, is_manual: bool = False):
+def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
+    """
+    img_data: może być ścieżką do pliku (str) lub obiektem PIL.Image
+    """
     global last_refresh_time
-    if not EPAPER_AVAILABLE: return False
+    if not EPAPER_AVAILABLE:
+        print("SYMULACJA: Matryca niedostępna.")
+        return False
 
     with HARDWARE_LOCK:
         now = time.time()
@@ -52,15 +55,22 @@ def draw_image_task(img_path: str, is_manual: bool = False):
         required_gap = 15 if is_manual else 60
 
         if time_since_last < required_gap:
+            print(f"BLOKADA: Odczekaj jeszcze {int(required_gap - time_since_last)}s")
             return False
 
         try:
             epd = epd7in5_V2.EPD()
             epd.init()
-            image = Image.open(img_path)
-            # Konwersja wymuszona (na wypadek gdyby plik został podmieniony)
+
+            if is_path:
+                image = Image.open(img_data)
+            else:
+                image = img_data # Już jest obiektem Image
+
+            # Finalna konwersja do formatu e-ink
             if image.mode != '1':
                 image = image.convert('L').convert('1', dither=Image.FLOYDSTEINBERG)
+
             epd.display(epd.getbuffer(image))
             epd.sleep()
             last_refresh_time = time.time()
@@ -93,16 +103,50 @@ def epaper_slideshow_loop():
 
 # --- ENDPOINTY ---
 
+@epaper_router.post("/epaper/show-text")
+def show_text_on_epaper(text: str, title: str = "POWIADOMIENIE"):
+    """Generuje obraz z tekstem i wysyła na e-papier z rygorem czasowym"""
+    # 1. Tworzymy białe tło 800x480
+    img = Image.new('L', (800, 480), 255)
+    draw = ImageDraw.Draw(img)
+
+    # 2. Próba załadowania czcionki
+    try:
+        # Ścieżka dla Raspberry Pi
+        font_main = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+    except:
+        font_main = ImageFont.load_default()
+        font_title = ImageFont.load_default()
+
+    # 3. Rysowanie ramki i tekstu
+    draw.rectangle([10, 10, 790, 470], outline=0, width=3)
+    draw.text((30, 30), title.upper(), font=font_title, fill=0)
+
+    # Proste zawijanie tekstu (łamanie na słowach jeśli za długi)
+    margin = 40
+    offset = 120
+    for line in [text[i:i+30] for i in range(0, len(text), 30)]:
+        draw.text((margin, offset), line, font=font_main, fill=0)
+        offset += 60
+
+    # 4. Wysłanie do matrycy (is_manual=True wymusza gap 15s)
+    success = draw_image_task(img, is_manual=True, is_path=False)
+
+    if success:
+        force_refresh_event.set()
+        return {"status": "Tekst wyświetlony", "text": text}
+    else:
+        raise HTTPException(status_code=429, detail="Matryca odpoczywa. Spróbuj za chwilę.")
+
 @epaper_router.post("/epaper/upload")
 async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Wgrywa zdjęcie do podfolderu 'uploaded/epaper/'"""
     new_img = EPaperImageModel(filename="temp", url="temp", is_active=True)
     db.add(new_img); db.commit(); db.refresh(new_img)
 
     content = await file.read()
     try:
         image = Image.open(io.BytesIO(content))
-        # Skalowanie i konwersja do stylu e-ink
         image = image.convert('L').resize((800, 480))
         image = image.convert('1', dither=Image.FLOYDSTEINBERG)
 

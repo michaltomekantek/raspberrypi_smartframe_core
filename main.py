@@ -17,12 +17,21 @@ from PIL import Image, ImageDraw, ImageFont
 
 # --- IMPORTY Z NASZYCH NOWYCH MODUŁÓW ---
 from database import Base, engine, SessionLocal, get_db
+
+# Moduł E-papieru
 try:
     from epaper_service import epaper_router, startup_epaper_display
 except ImportError:
     print("BŁĄD: Nie można zaimportować epaper_service.py!")
     epaper_router = None
     startup_epaper_display = None
+
+# Moduł Ustawień Systemowych (Shutdown/Reboot)
+try:
+    from settings import settings_router
+except ImportError:
+    print("OSTRZEŻENIE: Nie odnaleziono pliku settings.py!")
+    settings_router = None
 
 # --- MODEL TABELI DLA HDMI ---
 class ImageModel(Base):
@@ -33,16 +42,20 @@ class ImageModel(Base):
     added_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
-# --- INICJALIZACJA BAZY (Tworzy obie tabele: images i epaper_images) ---
+# --- INICJALIZACJA BAZY ---
+# Tworzy wszystkie tabele zdefiniowane w Base (images oraz epaper_images)
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="4.3.0")
+app = FastAPI(title="SmartFrame OS", version="4.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# PODPIĘCIE ROUTERA E-PAPIERU
+# PODPIĘCIE ROUTERÓW
 if epaper_router:
     app.include_router(epaper_router)
+
+if settings_router:
+    app.include_router(settings_router)
 
 # --- ARGUMENTY STARTOWE ---
 parser = argparse.ArgumentParser()
@@ -51,7 +64,7 @@ args = parser.parse_args()
 
 IS_MAC = (args.mode == "mac")
 UPLOAD_DIR = "uploaded"
-BASE_URL = "http://192.168.0.194/images/" # Zmień na swój IP jeśli trzeba
+BASE_URL = "http://192.168.0.194/images/" # Adres dla HDMI
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -62,7 +75,7 @@ global_interval = 10
 SCREEN_W, SCREEN_H = (1024, 600)
 skip_requested = False
 
-# --- LOGIKA SYSTEMOWA (HDMI) ---
+# --- LOGIKA SYSTEMOWA (HDMI DASHBOARD) ---
 
 def get_sys_data():
     ram = psutil.virtual_memory()
@@ -138,7 +151,7 @@ def render_to_pygame(path, screen_obj):
     except Exception as e:
         print(f"Blad renderowania HDMI: {e}")
 
-# --- PĘTLA WYŚWIETLANIA ---
+# --- PĘTLA WYŚWIETLANIA (HDMI) ---
 
 def global_display_loop():
     global dashboard_active, slideshow_running, global_interval, skip_requested
@@ -160,9 +173,13 @@ def global_display_loop():
 
         if dashboard_active:
             path = create_dashboard_image()
-            if IS_MAC: subprocess.run(["open", "-g", "-a", "Preview", path])
-            elif local_screen: render_to_pygame(path, local_screen)
+            if IS_MAC:
+                # Na Macu tylko generujemy obrazek (podgląd opcjonalny)
+                pass
+            elif local_screen:
+                render_to_pygame(path, local_screen)
             time.sleep(1)
+
         elif slideshow_running:
             db = SessionLocal()
             active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
@@ -182,12 +199,15 @@ def global_display_loop():
         else: time.sleep(1)
 
 # --- START WĄTKÓW ---
+
+# Wątek HDMI
 threading.Thread(target=global_display_loop, daemon=True).start()
 
+# Wątek E-papieru
 if startup_epaper_display:
     startup_epaper_display()
 
-# --- API ENDPOINTS (HDMI/LIBRARY) ---
+# --- API ENDPOINTS (HDMI / LIBRARY) ---
 
 @app.post("/upload", tags=["HDMI Library"])
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
