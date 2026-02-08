@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Import sterownika z Twojego folderu lib
 try:
-    from lib import epd7in5_V2
+    from lib.waveshare_epd import epd7in5_V2
     EPAPER_AVAILABLE = True
 except ImportError:
     print("BŁĄD: Nie znaleziono folderu lib w projekcie!")
