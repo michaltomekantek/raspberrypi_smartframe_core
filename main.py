@@ -15,6 +15,14 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from PIL import Image, ImageDraw, ImageFont
 
+# --- IMPORTY E-PAPIERU (Z TWOJEGO OSOBNEGO PLIKU) ---
+try:
+    from epaper_service import epaper_router, startup_epaper_display
+except ImportError:
+    print("BŁĄD: Nie można zaimportować epaper_service.py! Upewnij się, że plik istnieje.")
+    epaper_router = None
+    startup_epaper_display = None
+
 # --- KONFIGURACJA BAZY ---
 DATABASE_URL = "sqlite:///./smartframe.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -34,6 +42,10 @@ Base.metadata.create_all(bind=engine)
 # --- KONFIGURACJA APKI ---
 app = FastAPI(title="SmartFrame OS", version="4.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# PODPIĘCIE ENDPOINTÓW E-PAPIERU
+if epaper_router:
+    app.include_router(epaper_router)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("mode", nargs="?", default="pi", choices=["pi", "mac"])
@@ -57,7 +69,7 @@ def get_db():
     try: yield db
     finally: db.close()
 
-# --- LOGIKA SYSTEMOWA I RYSOWANIE ---
+# --- LOGIKA SYSTEMOWA I RYSOWANIE (HDMI) ---
 
 def get_sys_data():
     ram = psutil.virtual_memory()
@@ -79,9 +91,7 @@ def get_sys_data():
     }
 
 def draw_card(draw, x, y, w, h, label, value, unit, color):
-    # Tło karty z lekkim połyskiem
     draw.rounded_rectangle([x, y, x+w, y+h], radius=15, fill=(33, 37, 43))
-    # Akcent boczny (grubszy, bardziej nasycony)
     draw.rounded_rectangle([x, y, x+12, y+h], radius=5, fill=color)
 
     try:
@@ -93,16 +103,13 @@ def draw_card(draw, x, y, w, h, label, value, unit, color):
 
     draw.text((x+35, y+25), label, fill=(155, 160, 170), font=f_lbl)
     draw.text((x+35, y+55), f"{value}", fill=(255, 255, 255), font=f_val)
-    # Jednostka mniejszym drukiem obok wartości
     val_w = draw.textlength(f"{value}", font=f_val)
     draw.text((x+35+val_w+5, y+75), unit, fill=color, font=f_lbl)
 
 def create_dashboard_image():
     data = get_sys_data()
-    # Tło: Bardzo ciemny granat/czerń
     img = Image.new('RGB', (SCREEN_W, SCREEN_H), color=(18, 20, 24))
     draw = ImageDraw.Draw(img)
-
     y_offset = -20
 
     try:
@@ -114,21 +121,16 @@ def create_dashboard_image():
     except:
         f_time = ImageFont.load_default(); f_sec = ImageFont.load_default(); f_date = ImageFont.load_default(); f_ip = ImageFont.load_default()
 
-    # Zegar z wyróżnionymi sekundami
     time_w = draw.textlength(data["time"], font=f_time)
     draw.text((60, 50 + y_offset), data["time"], fill=(255, 255, 255), font=f_time)
     draw.text((60 + time_w + 5, 105 + y_offset), data["seconds"], fill=(97, 175, 239), font=f_sec)
-
-    # Data pod zegarem
     draw.text((65, 185 + y_offset), data["date"], fill=(152, 195, 121), font=f_date)
 
-    # Definicja kolorów One Dark
     COLOR_RED = (224, 108, 117)
     COLOR_ORANGE = (209, 154, 102)
     COLOR_PURPLE = (198, 120, 221)
     COLOR_CYAN = (86, 182, 194)
 
-    # Karty statystyk
     card_w, card_h = 285, 140
     row1_y = 270 + y_offset
     row2_y = 430 + y_offset
@@ -136,10 +138,8 @@ def create_dashboard_image():
     draw_card(draw, 60,  row1_y, card_w, card_h, "PROCESOR", data["cpu"], "%", COLOR_RED)
     draw_card(draw, 370, row1_y, card_w, card_h, "TERMAL", data["temp"], "°C", COLOR_ORANGE)
     draw_card(draw, 680, row1_y, card_w, card_h, "PAMIĘĆ RAM", data["ram"], "%", COLOR_PURPLE)
-
     draw_card(draw, 60,  row2_y, card_w, card_h, "DYSK SYSTEM", data["storage"], "%", COLOR_CYAN)
 
-    # Stopka z IP
     draw.rectangle([680, 560+y_offset, 965, 562+y_offset], fill=(45, 50, 60))
     draw.text((680, 570 + y_offset), f"NETWORK ADDRESS: {data['ip']}", fill=(92, 99, 112), font=f_ip)
 
@@ -157,7 +157,7 @@ def render_to_pygame(path, screen_obj):
     except Exception as e:
         print(f"Blad renderowania: {e}")
 
-# --- GŁÓWNA PĘTLA WYŚWIETLANIA ---
+# --- GŁÓWNA PĘTLA WYŚWIETLANIA (HDMI) ---
 
 def global_display_loop():
     global dashboard_active, slideshow_running, global_interval, skip_requested
@@ -205,18 +205,26 @@ def global_display_loop():
                             if skip_requested or not slideshow_running or dashboard_active:
                                 break
                             time.sleep(0.1)
-                            for event in pygame.event.get():
-                                if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
-                                    skip_requested = True
+                            if local_screen:
+                                for event in pygame.event.get():
+                                    if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
+                                        skip_requested = True
                         skip_requested = False
             else:
                 time.sleep(2)
         else:
             time.sleep(1)
 
+# --- START SYSTEMU ---
+
+# 1. Wątek HDMI (obsługa Pygame)
 threading.Thread(target=global_display_loop, daemon=True).start()
 
-# --- API ENDPOINTS (BEZ ZMIAN) ---
+# 2. Start e-papieru przy uruchomieniu programu
+if startup_epaper_display:
+    startup_epaper_display()
+
+# --- API ENDPOINTS ---
 
 @app.post("/upload", tags=["Library"])
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
