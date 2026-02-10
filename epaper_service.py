@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import Session
 
-# Import bazy danych (założyłem, że pliki są w tym samym folderze)
+# Import bazy danych (założenie: plik database.py istnieje w folderze)
 from database import Base, SessionLocal, get_db
 
 class EPaperImageModel(Base):
@@ -39,7 +39,7 @@ os.makedirs(UPLOAD_EPAPER_DIR, exist_ok=True)
 # --- ZABEZPIECZENIA I STAN ---
 HARDWARE_LOCK = threading.Lock()
 last_refresh_time = 0
-epaper_interval = 600.0  # 10 minut
+epaper_interval = 120.0  # ZMIANA: Domyślnie 120 sekund (bezpieczne)
 slideshow_running = False
 force_refresh_event = threading.Event()
 
@@ -52,9 +52,9 @@ def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
     with HARDWARE_LOCK:
         now = time.time()
         time_since_last = now - last_refresh_time
+        # Bezpieczniki: 10s dla akcji ręcznej, 60s dla automatu (chroni przed pętlami)
         required_gap = 10 if is_manual else 60
 
-        # ZMIANA: Jeśli to slideshow, czekamy zamiast wyrzucać błąd
         if time_since_last < required_gap:
             if not is_manual:
                 wait_time = required_gap - time_since_last
@@ -95,16 +95,13 @@ def epaper_slideshow_loop():
             db.close()
 
             if active_images:
-                # ZMIANA: Mieszamy kolejność zdjęć
                 random.shuffle(active_images)
-
                 for img_record in active_images:
                     if not slideshow_running:
                         break
 
                     file_path = os.path.join(UPLOAD_EPAPER_DIR, img_record.filename)
                     if os.path.exists(file_path):
-                        # Wyświetlamy zdjęcie (draw_image_task samo poczeka jeśli trzeba)
                         draw_image_task(file_path, is_manual=False)
 
                         # Czekamy na interwał lub przerwanie manualne
@@ -119,9 +116,14 @@ def epaper_slideshow_loop():
 
 # --- ENDPOINTY ---
 
+@epaper_router.get("/epaper/settings/interval")
+def get_epaper_interval():
+    """NOWY: Pobiera aktualny interwał odświeżania w sekundach."""
+    return {"interval": epaper_interval}
+
 @epaper_router.post("/epaper/control/clear")
 def clear_epaper():
-    """NOWY: Pełne czyszczenie matrycy do białości."""
+    """Pełne czyszczenie matrycy do białości."""
     if not EPAPER_AVAILABLE:
         return {"status": "Symulacja: Ekran wyczyszczony"}
 
@@ -132,7 +134,7 @@ def clear_epaper():
             epd.init()
             epd.Clear()
             epd.sleep()
-            force_refresh_event.set() # Budzimy slideshow, żeby wiedział o zmianie
+            force_refresh_event.set()
             return {"status": "Matryca wyczyszczona"}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -215,7 +217,7 @@ def epaper_stop():
 @epaper_router.post("/epaper/settings/interval")
 def set_epaper_interval(seconds: int):
     global epaper_interval
-    if seconds < 60: raise HTTPException(status_code=400, detail="Min 60s")
+    if seconds < 30: raise HTTPException(status_code=400, detail="Bezpieczne minimum to 30s")
     epaper_interval = float(seconds)
     return {"interval": epaper_interval}
 
