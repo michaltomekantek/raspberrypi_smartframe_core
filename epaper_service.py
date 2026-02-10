@@ -39,10 +39,14 @@ os.makedirs(UPLOAD_EPAPER_DIR, exist_ok=True)
 # --- ZABEZPIECZENIA I STAN ---
 HARDWARE_LOCK = threading.Lock()
 last_refresh_time = 0
-next_refresh_time = 0 # NOWOŚĆ: Przechowuje planowany czas zmiany
+next_refresh_time = 0
 epaper_interval = 120.0
 slideshow_running = False
 force_refresh_event = threading.Event()
+
+# NOWOŚĆ: Przechowywanie informacji o zdjęciach
+current_image = None
+next_image = None
 
 def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
     global last_refresh_time
@@ -57,13 +61,11 @@ def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
 
         if time_since_last < required_gap:
             if not is_manual:
-                wait_time = required_gap - time_since_last
-                time.sleep(wait_time)
+                time.sleep(required_gap - time_since_last)
             else:
                 return False
 
         try:
-            print(f"🔄 Odświeżanie matrycy...")
             epd = epd7in5_V2.EPD()
             epd.init()
             image = Image.open(img_data) if is_path else img_data
@@ -78,7 +80,7 @@ def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
             return False
 
 def epaper_slideshow_loop():
-    global slideshow_running, next_refresh_time
+    global slideshow_running, next_refresh_time, current_image, next_image
     print("🚀 Wątek slideshow aktywny.")
     while True:
         if slideshow_running:
@@ -88,33 +90,35 @@ def epaper_slideshow_loop():
 
             if active_images:
                 random.shuffle(active_images)
-                for img_record in active_images:
+
+                for i in range(len(active_images)):
                     if not slideshow_running:
                         break
 
-                    file_path = os.path.join(UPLOAD_EPAPER_DIR, img_record.filename)
+                    # Ustawiamy co jest teraz, a co będzie następne
+                    current_image = active_images[i]
+                    next_image = active_images[(i + 1) % len(active_images)] # Następne w kółku
+
+                    file_path = os.path.join(UPLOAD_EPAPER_DIR, current_image.filename)
                     if os.path.exists(file_path):
                         draw_image_task(file_path, is_manual=False)
-
-                        # AKTUALIZACJA: Obliczamy kiedy nastąpi kolejny refresh
                         next_refresh_time = time.time() + epaper_interval
 
                         if force_refresh_event.wait(timeout=epaper_interval):
-                            print("🔔 Reset kolejki.")
                             force_refresh_event.clear()
                             break
             else:
-                next_refresh_time = 0
+                current_image = next_image = None
                 time.sleep(5)
         else:
-            next_refresh_time = 0
+            current_image = next_image = None
             time.sleep(1)
 
 # --- ENDPOINTY ---
 
 @epaper_router.get("/epaper/settings/status")
 def get_slideshow_status():
-    """NOWOŚĆ: Pobiera info ile zostało do następnego zdjęcia"""
+    """Zwraca info o czasie, stanie oraz obecnym i następnym zdjęciu"""
     remaining = 0
     if slideshow_running and next_refresh_time > 0:
         remaining = max(0, int(next_refresh_time - time.time()))
@@ -123,6 +127,8 @@ def get_slideshow_status():
         "slideshow_running": slideshow_running,
         "remaining_seconds": remaining,
         "interval": epaper_interval,
+        "current_image": current_image,
+        "next_image": next_image,
         "last_refresh": datetime.fromtimestamp(last_refresh_time).isoformat() if last_refresh_time > 0 else None
     }
 
@@ -135,7 +141,6 @@ def set_epaper_interval(seconds: int):
     global epaper_interval
     if seconds < 30: raise HTTPException(status_code=400, detail="Min 30s")
     epaper_interval = float(seconds)
-    # Wymuszamy refresh, żeby nowy interwał wszedł w życie od razu
     force_refresh_event.set()
     return {"interval": epaper_interval}
 
@@ -153,7 +158,7 @@ def clear_epaper():
 def show_text_on_epaper(text: str, title: str = "POWIADOMIENIE"):
     img = Image.new('L', (800, 480), 255)
     draw = ImageDraw.Draw(img)
-    # ... (pominięto logikę rysowania tekstu dla czytelności, jest identyczna jak wcześniej)
+    # ... logika rysowania tekstu ...
     if draw_image_task(img, is_manual=True, is_path=False):
         force_refresh_event.set()
         return {"status": "Wysłano"}
@@ -202,7 +207,7 @@ def delete_epaper_image(image_id: int, db: Session = Depends(get_db)):
 def epaper_start():
     global slideshow_running
     slideshow_running = True
-    force_refresh_event.set() # Startujemy od razu
+    force_refresh_event.set()
     return {"status": "Slideshow ON"}
 
 @epaper_router.post("/epaper/control/stop")
