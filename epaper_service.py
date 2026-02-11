@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import Session
 
-# Import bazy danych
+# Import bazy danych (upewnij się, że plik database.py istnieje w tym samym folderze)
 from database import Base, SessionLocal, get_db
 
 class EPaperImageModel(Base):
@@ -20,38 +20,38 @@ class EPaperImageModel(Base):
     added_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
+# Próba inicjalizacji hardware'u
 try:
     from lib.waveshare_epd import epd7in5_V2
     EPAPER_AVAILABLE = True
     print("✅ Hardware e-papieru wykryty.")
 except ImportError:
     EPAPER_AVAILABLE = False
-    print("⚠️ Hardware NIE wykryty. Tryb symulacji włączony.")
+    print("⚠️ Hardware NIE wykryty. Tryb symulacji.")
 
 epaper_router = APIRouter(tags=["E-Paper Control"])
 
-# Ścieżki
+# Konfiguracja ścieżek
 UPLOAD_EPAPER_DIR = os.path.join("uploaded", "epaper")
 BASE_URL = "http://192.168.0.194/images/epaper/"
-
 os.makedirs(UPLOAD_EPAPER_DIR, exist_ok=True)
 
-# --- ZABEZPIECZENIA I STAN ---
+# --- MECHANIZM OPTYMALIZACJI (EVENTS) ---
 HARDWARE_LOCK = threading.Lock()
+slideshow_event = threading.Event()    # Blokuje wątek, gdy slideshow jest OFF
+force_refresh_event = threading.Event() # Przerywa czekanie (np. zmiana interwału)
+
 last_refresh_time = 0
 next_refresh_time = 0
 epaper_interval = 120.0
-slideshow_running = False
-force_refresh_event = threading.Event()
-
-# NOWOŚĆ: Przechowywanie informacji o zdjęciach
+slideshow_running = False  # Startuje jako wyłączony, żeby nie mielić CPU na starcie
 current_image = None
 next_image = None
 
 def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
     global last_refresh_time
     if not EPAPER_AVAILABLE:
-        print("SYMULACJA: Wyświetlam obraz w konsoli.")
+        print("SYMULACJA: Wyświetlam obraz.")
         return True
 
     with HARDWARE_LOCK:
@@ -76,145 +76,110 @@ def draw_image_task(img_data, is_manual: bool = False, is_path: bool = True):
             last_refresh_time = time.time()
             return True
         except Exception as e:
-            print(f"🔥 Błąd: {e}")
+            print(f"🔥 Błąd matrycy: {e}")
             return False
 
 def epaper_slideshow_loop():
-    global slideshow_running, next_refresh_time, current_image, next_image
-    print("🚀 Wątek slideshow aktywny.")
+    global current_image, next_image, next_refresh_time, slideshow_running
+    print("🚀 Wątek e-papieru zainicjowany (oczekiwanie na sygnał startu).")
+
     while True:
-        if slideshow_running:
-            db = SessionLocal()
+        # Jeśli slideshow jest wyłączony, wątek TU ZAMARZA (0% CPU)
+        if not slideshow_running:
+            slideshow_event.wait()
+
+        db = SessionLocal()
+        try:
             active_images = db.query(EPaperImageModel).filter(EPaperImageModel.is_active == True).all()
+        finally:
             db.close()
 
-            if active_images:
-                random.shuffle(active_images)
+        if active_images and slideshow_running:
+            random.shuffle(active_images)
+            for i in range(len(active_images)):
+                if not slideshow_running:
+                    break
 
-                for i in range(len(active_images)):
-                    if not slideshow_running:
+                current_image = active_images[i]
+                next_image = active_images[(i + 1) % len(active_images)]
+
+                file_path = os.path.join(UPLOAD_EPAPER_DIR, current_image.filename)
+                if os.path.exists(file_path):
+                    draw_image_task(file_path, is_manual=False)
+
+                    # Obliczamy kiedy następna zmiana
+                    next_refresh_time = time.time() + epaper_interval
+
+                    # Wątek zasypia na 'epaper_interval' LUB do czasu force_refresh_event.set()
+                    interrupted = force_refresh_event.wait(timeout=epaper_interval)
+                    force_refresh_event.clear()
+                    if interrupted:
+                        print("🔔 Odświeżanie wymuszone przed czasem.")
                         break
-
-                    # Ustawiamy co jest teraz, a co będzie następne
-                    current_image = active_images[i]
-                    next_image = active_images[(i + 1) % len(active_images)] # Następne w kółku
-
-                    file_path = os.path.join(UPLOAD_EPAPER_DIR, current_image.filename)
-                    if os.path.exists(file_path):
-                        draw_image_task(file_path, is_manual=False)
-                        next_refresh_time = time.time() + epaper_interval
-
-                        if force_refresh_event.wait(timeout=epaper_interval):
-                            force_refresh_event.clear()
-                            break
-            else:
-                current_image = next_image = None
-                time.sleep(5)
         else:
-            current_image = next_image = None
-            time.sleep(1)
+            # Jeśli brak zdjęć, poczekaj chwilę przed ponownym sprawdzeniem bazy
+            time.sleep(10)
 
 # --- ENDPOINTY ---
 
 @epaper_router.get("/epaper/settings/status")
 def get_slideshow_status():
-    """Zwraca info o czasie, stanie oraz obecnym i następnym zdjęciu"""
     remaining = 0
     if slideshow_running and next_refresh_time > 0:
         remaining = max(0, int(next_refresh_time - time.time()))
-
     return {
         "slideshow_running": slideshow_running,
         "remaining_seconds": remaining,
         "interval": epaper_interval,
         "current_image": current_image,
-        "next_image": next_image,
-        "last_refresh": datetime.fromtimestamp(last_refresh_time).isoformat() if last_refresh_time > 0 else None
+        "next_image": next_image
     }
-
-@epaper_router.get("/epaper/settings/interval")
-def get_epaper_interval():
-    return {"interval": epaper_interval}
 
 @epaper_router.post("/epaper/settings/interval")
 def set_epaper_interval(seconds: int):
     global epaper_interval
-    if seconds < 30: raise HTTPException(status_code=400, detail="Min 30s")
+    if seconds < 30:
+        raise HTTPException(status_code=400, detail="Minimum 30s")
     epaper_interval = float(seconds)
-    force_refresh_event.set()
+    force_refresh_event.set() # Natychmiastowe zastosowanie nowego interwału
     return {"interval": epaper_interval}
-
-@epaper_router.post("/epaper/control/clear")
-def clear_epaper():
-    if not EPAPER_AVAILABLE: return {"status": "Symulacja: Biały ekran"}
-    with HARDWARE_LOCK:
-        try:
-            epd = epd7in5_V2.EPD(); epd.init(); epd.Clear(); epd.sleep()
-            force_refresh_event.set()
-            return {"status": "Matryca wyczyszczona"}
-        except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@epaper_router.post("/epaper/show-text")
-def show_text_on_epaper(text: str, title: str = "POWIADOMIENIE"):
-    img = Image.new('L', (800, 480), 255)
-    draw = ImageDraw.Draw(img)
-    # ... logika rysowania tekstu ...
-    if draw_image_task(img, is_manual=True, is_path=False):
-        force_refresh_event.set()
-        return {"status": "Wysłano"}
-    raise HTTPException(status_code=429)
-
-@epaper_router.post("/epaper/upload")
-async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    new_img = EPaperImageModel(filename="temp", url="temp", is_active=True)
-    db.add(new_img); db.commit(); db.refresh(new_img)
-    content = await file.read()
-    try:
-        image = Image.open(io.BytesIO(content)).convert('L').resize((800, 480))
-        filename = f"epd_{new_img.id}.png"
-        image.save(os.path.join(UPLOAD_EPAPER_DIR, filename))
-        new_img.filename, new_img.url = filename, f"{BASE_URL}{filename}"
-        db.commit()
-        draw_image_task(os.path.join(UPLOAD_EPAPER_DIR, filename), is_manual=True)
-        force_refresh_event.set()
-        return new_img
-    except Exception as e:
-        db.delete(new_img); db.commit()
-        raise HTTPException(status_code=400, detail=str(e))
-
-@epaper_router.get("/epaper/images")
-def get_epaper_images(db: Session = Depends(get_db)):
-    return db.query(EPaperImageModel).order_by(EPaperImageModel.added_at.desc()).all()
-
-@epaper_router.post("/epaper/show/{image_id}")
-def show_specific_image(image_id: int, db: Session = Depends(get_db)):
-    img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
-    if not img or not draw_image_task(os.path.join(UPLOAD_EPAPER_DIR, img.filename), is_manual=True):
-        raise HTTPException(status_code=429 if img else 404)
-    force_refresh_event.set()
-    return {"status": "Wysłano"}
-
-@epaper_router.delete("/epaper/images/{image_id}")
-def delete_epaper_image(image_id: int, db: Session = Depends(get_db)):
-    img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
-    if img:
-        p = os.path.join(UPLOAD_EPAPER_DIR, img.filename);
-        if os.path.exists(p): os.remove(p)
-        db.delete(img); db.commit()
-    return {"status": "deleted"}
 
 @epaper_router.post("/epaper/control/start")
 def epaper_start():
     global slideshow_running
     slideshow_running = True
-    force_refresh_event.set()
+    slideshow_event.set() # Budzimy wątek ze snu
+    force_refresh_event.set() # Wymuszamy start pierwszego zdjęcia
     return {"status": "Slideshow ON"}
 
 @epaper_router.post("/epaper/control/stop")
 def epaper_stop():
     global slideshow_running
     slideshow_running = False
+    slideshow_event.clear() # Wątek zasypia przy najbliższej okazji
     return {"status": "Slideshow OFF"}
 
+@epaper_router.post("/epaper/upload")
+async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    content = await file.read()
+    new_img = EPaperImageModel(filename="temp", url="temp")
+    db.add(new_img)
+    db.commit()
+    db.refresh(new_img)
+    try:
+        image = Image.open(io.BytesIO(content)).convert('L').resize((800, 480))
+        filename = f"epd_{new_img.id}.png"
+        save_path = os.path.join(UPLOAD_EPAPER_DIR, filename)
+        image.save(save_path)
+        new_img.filename, new_img.url = filename, f"{BASE_URL}{filename}"
+        db.commit()
+        draw_image_task(save_path, is_manual=True)
+        force_refresh_event.set()
+        return new_img
+    except Exception as e:
+        db.delete(new_img); db.commit()
+        raise HTTPException(status_code=400, detail=str(e))
+
 def startup_epaper_display():
-    threading.Thread(target=epaper_slideshow_loop, daemon=True).start()
+    t = threading.Thread(target=epaper_slideshow_loop, daemon=True)
+    t.start()
