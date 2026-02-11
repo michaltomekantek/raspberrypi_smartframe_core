@@ -119,7 +119,7 @@ def show_specific_image(image_id: int):
 
 # --- ENDPOINTY KONTROLNE ---
 
-@epaper_router.get("/epaper/status")
+@epaper_router.get("/epaper/settings/status")
 def get_epaper_status():
     """Zwraca pełny status pokazu slajdów"""
     remaining = 0
@@ -164,3 +164,15 @@ def delete_epaper_image(image_id: int):
         if os.path.exists(p): os.remove(p)
         db.delete(img); db.commit()
     return {"status": "deleted"}
+
+@app.get("/epaper/test-performance")
+async def test_performance():
+    """
+    Endpoint zero-resource. Nie dotyka bazy, nie dotyka sprzętu.
+    Jeśli to muli, to znaczy że serwer jest zablokowany na poziomie wątków.
+    """
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "message": "FastAPI is alive!"
+    }
