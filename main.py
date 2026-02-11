@@ -15,7 +15,7 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import Session
 from PIL import Image, ImageDraw, ImageFont
 
-# --- IMPORTY Z NASZYCH NOWYCH MODUŁÓW ---
+# --- IMPORTY Z NASZYCH MODUŁÓW ---
 from database import Base, engine, SessionLocal, get_db
 
 # Moduł E-papieru
@@ -43,17 +43,15 @@ class ImageModel(Base):
     is_active = Column(Boolean, default=True)
 
 # --- INICJALIZACJA BAZY ---
-# Tworzy wszystkie tabele zdefiniowane w Base (images oraz epaper_images)
 Base.metadata.create_all(bind=engine)
 
 # --- KONFIGURACJA APKI ---
-app = FastAPI(title="SmartFrame OS", version="4.5.0")
+app = FastAPI(title="SmartFrame OS", version="4.5.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # PODPIĘCIE ROUTERÓW
 if epaper_router:
     app.include_router(epaper_router)
-
 if settings_router:
     app.include_router(settings_router)
 
@@ -68,12 +66,13 @@ BASE_URL = "http://192.168.0.194/images/" # Adres dla HDMI
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# --- ZMIENNE GLOBALNE ---
+# --- ZMIENNE GLOBALNE I KONTROLA WĄTKÓW ---
 dashboard_active = False
 slideshow_running = False
 global_interval = 10
 SCREEN_W, SCREEN_H = (1024, 600)
 skip_requested = False
+hdmi_event = threading.Event() # Mechanizm blokady (0% CPU gdy nic nie wyświetlamy)
 
 # --- LOGIKA SYSTEMOWA (HDMI DASHBOARD) ---
 
@@ -149,7 +148,7 @@ def render_to_pygame(path, screen_obj):
         screen_obj.blit(surf, (0, 0))
         pygame.display.update()
     except Exception as e:
-        print(f"Blad renderowania HDMI: {e}")
+        print(f"Błąd renderowania HDMI: {e}")
 
 # --- PĘTLA WYŚWIETLANIA (HDMI) ---
 
@@ -162,9 +161,14 @@ def global_display_loop():
             pygame.init()
             local_screen = pygame.display.set_mode((1024, 600), pygame.FULLSCREEN | pygame.NOFRAME)
             pygame.mouse.set_visible(False)
-        except Exception as e: print(f"Blad Pygame: {e}")
+        except Exception as e: print(f"Błąd Pygame: {e}")
 
     while True:
+        # KLUCZ: Jeśli nic nie robimy na HDMI, wątek zasypia (nie bierze CPU)
+        if not dashboard_active and not slideshow_running:
+            hdmi_event.wait(timeout=2)
+            if not dashboard_active and not slideshow_running: continue
+
         if local_screen:
             import pygame
             for event in pygame.event.get():
@@ -173,37 +177,37 @@ def global_display_loop():
 
         if dashboard_active:
             path = create_dashboard_image()
-            if IS_MAC:
-                # Na Macu tylko generujemy obrazek (podgląd opcjonalny)
-                pass
-            elif local_screen:
+            if not IS_MAC and local_screen:
                 render_to_pygame(path, local_screen)
             time.sleep(1)
 
         elif slideshow_running:
             db = SessionLocal()
-            active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
-            db.close()
+            try:
+                active_images = db.query(ImageModel).filter(ImageModel.is_active == True).all()
+            finally:
+                db.close()
+
             if active_images:
                 for img in active_images:
                     if not slideshow_running or dashboard_active: break
                     path = os.path.abspath(os.path.join(UPLOAD_DIR, img.filename))
                     if os.path.exists(path):
-                        if local_screen: render_to_pygame(path, local_screen)
+                        if not IS_MAC and local_screen: render_to_pygame(path, local_screen)
                         start_wait = time.time()
                         while time.time() - start_wait < global_interval:
                             if skip_requested or not slideshow_running or dashboard_active: break
-                            time.sleep(0.1)
+                            if not IS_MAC:
+                                for event in pygame.event.get():
+                                    if event.type in [pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN]:
+                                        skip_requested = True
+                            time.sleep(0.5)
                         skip_requested = False
             else: time.sleep(2)
         else: time.sleep(1)
 
 # --- START WĄTKÓW ---
-
-# Wątek HDMI
 threading.Thread(target=global_display_loop, daemon=True).start()
-
-# Wątek E-papieru
 if startup_epaper_display:
     startup_epaper_display()
 
@@ -213,9 +217,7 @@ if startup_epaper_display:
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     ext = os.path.splitext(file.filename)[1].lower()
     new_img = ImageModel(filename="temp", url="temp")
-    db.add(new_img)
-    db.commit()
-    db.refresh(new_img)
+    db.add(new_img); db.commit(); db.refresh(new_img)
     new_filename = f"{new_img.id}{ext}"
     final_path = os.path.join(UPLOAD_DIR, new_filename)
     content = await file.read()
@@ -229,12 +231,14 @@ async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
 def show_stats():
     global dashboard_active, slideshow_running
     slideshow_running = False; dashboard_active = True
+    hdmi_event.set() # Budzimy HDMI
     return {"status": "Stats mode active"}
 
 @app.get("/start-slideshow", tags=["Display Control"])
 def start_slideshow():
     global dashboard_active, slideshow_running
     dashboard_active = False; slideshow_running = True
+    hdmi_event.set() # Budzimy HDMI
     return {"status": "Slideshow started"}
 
 @app.get("/images", tags=["HDMI Library"])
@@ -247,9 +251,19 @@ def delete_image(image_id: int, db: Session = Depends(get_db)):
     if not img: raise HTTPException(status_code=404)
     file_path = os.path.join(UPLOAD_DIR, img.filename)
     if os.path.exists(file_path): os.remove(file_path)
-    db.delete(img)
-    db.commit()
+    db.delete(img); db.commit()
     return {"status": "deleted", "id": image_id}
 
+# Dodaj brakujące endpointy konfiguracji, jeśli jakieś miałeś
+@app.get("/settings/interval", tags=["Display Control"])
+def get_hdmi_interval():
+    return {"interval": global_interval}
+
+@app.post("/settings/interval", tags=["Display Control"])
+def set_hdmi_interval(seconds: int):
+    global global_interval
+    global_interval = seconds
+    return {"status": "Interval updated", "interval": global_interval}
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
