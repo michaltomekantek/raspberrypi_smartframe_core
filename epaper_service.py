@@ -165,7 +165,7 @@ def delete_epaper_image(image_id: int):
         db.delete(img); db.commit()
     return {"status": "deleted"}
 
-@app.get("/epaper/test-performance")
+@epaper_router.get("/epaper/test-performance")
 async def test_performance():
     """
     Endpoint zero-resource. Nie dotyka bazy, nie dotyka sprzętu.
