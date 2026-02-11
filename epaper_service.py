@@ -33,9 +33,20 @@ def get_db():
 epaper_interval = 120
 slideshow_active = False
 slideshow_thread = None
-current_image_info = None
-next_image_info = None
+current_image_info = None  # Przechowuje teraz pełny słownik danych
+next_image_info = None     # Przechowuje teraz pełny słownik danych
 last_refresh_time = 0
+
+def image_to_dict(img_model):
+    """Pomocnicza funkcja do zamiany modelu SQLAlchemy na słownik"""
+    if not img_model: return None
+    return {
+        "id": img_model.id,
+        "filename": img_model.filename,
+        "url": img_model.url,
+        "is_active": img_model.is_active,
+        "added_at": img_model.added_at.isoformat() if img_model.added_at else None
+    }
 
 def draw_on_hardware(img_source):
     if not EPAPER_AVAILABLE:
@@ -58,17 +69,20 @@ def slideshow_worker():
         try:
             imgs = worker_db.query(EPaperImageModel).filter(EPaperImageModel.is_active == True).all()
             if imgs:
+                # Wybór aktualnego zdjęcia
                 if len(imgs) > 1:
                     pool = [img for img in imgs if current_image_info and img.id != current_image_info.get('id')]
                     selected = random.choice(pool if pool else imgs)
                 else:
                     selected = imgs[0]
 
-                current_image_info = {"id": selected.id, "filename": selected.filename}
-                last_refresh_time = time.time()
+                # Wybór następnego zdjęcia do zapowiedzi w statusie
+                next_selected = random.choice(imgs)
 
-                next_img = random.choice(imgs)
-                next_image_info = {"id": next_img.id, "filename": next_img.filename}
+                # Zapisujemy pełne informacje dla endpointu statusu
+                current_image_info = image_to_dict(selected)
+                next_image_info = image_to_dict(next_selected)
+                last_refresh_time = time.time()
 
                 draw_on_hardware(os.path.join(UPLOAD_EPAPER_DIR, selected.filename))
         finally:
@@ -97,6 +111,9 @@ async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_
 
     new_img.filename, new_img.url = fname, f"{BASE_URL}{fname}"
     db.commit()
+
+    # Przy ręcznym uploadzie nie aktualizujemy slideshow_worker (zrobi to sam w kolejnej pętli),
+    # ale od razu wrzucamy na ekran
     draw_on_hardware(fpath)
     return new_img
 
@@ -124,12 +141,18 @@ def get_epaper_status():
         elapsed = time.time() - last_refresh_time
         remaining = max(0, int(epaper_interval - elapsed))
 
+    # Konwersja czasu ostatniego odświeżenia na format ISO
+    last_refresh_iso = None
+    if last_refresh_time > 0:
+        last_refresh_iso = datetime.fromtimestamp(last_refresh_time).isoformat()
+
     return {
-        "slideshow_active": slideshow_active,
-        "current_image": current_image_info,
-        "next_refresh_in": remaining,
+        "slideshow_running": slideshow_active,
+        "remaining_seconds": remaining,
         "interval": epaper_interval,
-        "epaper_available": EPAPER_AVAILABLE
+        "current_image": current_image_info,
+        "next_image": next_image_info,
+        "last_refresh": last_refresh_iso
     }
 
 @epaper_router.post("/epaper/settings/interval")
