@@ -33,8 +33,8 @@ def get_db():
 epaper_interval = 120
 slideshow_active = False
 slideshow_thread = None
-current_image_info = None  # Przechowuje teraz pełny słownik danych
-next_image_info = None     # Przechowuje teraz pełny słownik danych
+current_image_info = None
+next_image_info = None
 last_refresh_time = 0
 
 def image_to_dict(img_model):
@@ -69,17 +69,14 @@ def slideshow_worker():
         try:
             imgs = worker_db.query(EPaperImageModel).filter(EPaperImageModel.is_active == True).all()
             if imgs:
-                # Wybór aktualnego zdjęcia
                 if len(imgs) > 1:
                     pool = [img for img in imgs if current_image_info and img.id != current_image_info.get('id')]
                     selected = random.choice(pool if pool else imgs)
                 else:
                     selected = imgs[0]
 
-                # Wybór następnego zdjęcia do zapowiedzi w statusie
                 next_selected = random.choice(imgs)
 
-                # Zapisujemy pełne informacje dla endpointu statusu
                 current_image_info = image_to_dict(selected)
                 next_image_info = image_to_dict(next_selected)
                 last_refresh_time = time.time()
@@ -111,19 +108,20 @@ async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_
 
     new_img.filename, new_img.url = fname, f"{BASE_URL}{fname}"
     db.commit()
-
-    # Przy ręcznym uploadzie nie aktualizujemy slideshow_worker (zrobi to sam w kolejnej pętli),
-    # ale od razu wrzucamy na ekran
     draw_on_hardware(fpath)
     return new_img
 
-@epaper_router.patch("/epaper/images/{image_id}/toggle")
-def toggle_image_active(image_id: int, db: Session = Depends(get_db)):
+@epaper_router.patch("/epaper/images/{image_id}")
+def set_image_active(image_id: int, is_active: bool, db: Session = Depends(get_db)):
+    """Ustawia konkretny stan (is_active) dla zdjęcia (zamiast toggle)"""
     img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
-    if not img: raise HTTPException(status_code=404)
-    img.is_active = not img.is_active
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    img.is_active = is_active
     db.commit()
-    return {"id": img.id, "is_active": img.is_active}
+    db.refresh(img)
+    return image_to_dict(img)
 
 @epaper_router.post("/epaper/show/{image_id}")
 def show_specific_image(image_id: int, db: Session = Depends(get_db)):
@@ -141,7 +139,6 @@ def get_epaper_status():
         elapsed = time.time() - last_refresh_time
         remaining = max(0, int(epaper_interval - elapsed))
 
-    # Konwersja czasu ostatniego odświeżenia na format ISO
     last_refresh_iso = None
     if last_refresh_time > 0:
         last_refresh_iso = datetime.fromtimestamp(last_refresh_time).isoformat()
