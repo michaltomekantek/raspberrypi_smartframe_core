@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy.orm import Session
 from database import Base, SessionLocal
 
 # --- MODEL ---
@@ -28,8 +29,17 @@ UPLOAD_EPAPER_DIR = os.path.join("uploaded", "epaper")
 BASE_URL = "http://192.168.0.194/images/epaper/"
 os.makedirs(UPLOAD_EPAPER_DIR, exist_ok=True)
 
+# --- DEPENDENCY ---
+# Funkcja tworząca świeżą sesję dla każdego zapytania HTTP
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 # --- STAN GLOBALNY ---
-db = SessionLocal()
+# USUNIĘTO: db = SessionLocal() -> Teraz sesje są lokalne (bezpieczniejsze)
 epaper_interval = 120
 slideshow_active = False
 slideshow_thread = None
@@ -54,24 +64,29 @@ def draw_on_hardware(img_source):
 def slideshow_worker():
     global slideshow_active, current_image_info, next_image_info, last_refresh_time
     while slideshow_active:
-        # Pobieramy tylko aktywne zdjęcia
-        imgs = db.query(EPaperImageModel).filter(EPaperImageModel.is_active == True).all()
-        if imgs:
-            if len(imgs) > 1:
-                # Losujemy, dbając by nie było to samo co teraz (jeśli możliwe)
-                pool = [img for img in imgs if current_image_info and img.id != current_image_info.get('id')]
-                selected = random.choice(pool if pool else imgs)
-            else:
-                selected = imgs[0]
+        # Tworzymy osobną sesję dla wątku tła
+        worker_db = SessionLocal()
+        try:
+            # Pobieramy tylko aktywne zdjęcia używając sesji wątku
+            imgs = worker_db.query(EPaperImageModel).filter(EPaperImageModel.is_active == True).all()
+            if imgs:
+                if len(imgs) > 1:
+                    # Losujemy, dbając by nie było to samo co teraz (jeśli możliwe)
+                    pool = [img for img in imgs if current_image_info and img.id != current_image_info.get('id')]
+                    selected = random.choice(pool if pool else imgs)
+                else:
+                    selected = imgs[0]
 
-            current_image_info = {"id": selected.id, "filename": selected.filename}
-            last_refresh_time = time.time()
+                current_image_info = {"id": selected.id, "filename": selected.filename}
+                last_refresh_time = time.time()
 
-            # Przygotuj info o następnym (podgląd dla statusu)
-            next_img = random.choice(imgs)
-            next_image_info = {"id": next_img.id, "filename": next_img.filename}
+                # Przygotuj info o następnym (podgląd dla statusu)
+                next_img = random.choice(imgs)
+                next_image_info = {"id": next_img.id, "filename": next_img.filename}
 
-            draw_on_hardware(os.path.join(UPLOAD_EPAPER_DIR, selected.filename))
+                draw_on_hardware(os.path.join(UPLOAD_EPAPER_DIR, selected.filename))
+        finally:
+            worker_db.close()
 
         # Inteligentne czekanie (sprawdza co sekundę czy nie wyłączono pokazu)
         for _ in range(int(epaper_interval)):
@@ -81,11 +96,11 @@ def slideshow_worker():
 # --- ENDPOINTY ZARZĄDZANIA ---
 
 @epaper_router.get("/epaper/images")
-def get_epaper_images():
+def get_epaper_images(db: Session = Depends(get_db)):
     return db.query(EPaperImageModel).all()
 
 @epaper_router.post("/epaper/upload")
-async def epaper_upload(file: UploadFile = File(...)):
+async def epaper_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     content = await file.read()
     new_img = EPaperImageModel(filename="temp", url="temp", is_active=True)
     db.add(new_img); db.commit(); db.refresh(new_img)
@@ -101,7 +116,7 @@ async def epaper_upload(file: UploadFile = File(...)):
     return new_img
 
 @epaper_router.patch("/epaper/images/{image_id}/toggle")
-def toggle_image_active(image_id: int):
+def toggle_image_active(image_id: int, db: Session = Depends(get_db)):
     """Włącza/wyłącza zdjęcie z pokazu slajdów"""
     img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
     if not img: raise HTTPException(status_code=404)
@@ -110,7 +125,7 @@ def toggle_image_active(image_id: int):
     return {"id": img.id, "is_active": img.is_active}
 
 @epaper_router.post("/epaper/show/{image_id}")
-def show_specific_image(image_id: int):
+def show_specific_image(image_id: int, db: Session = Depends(get_db)):
     """Ustawia wybrane zdjęcie na ramce w tej chwili"""
     img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
     if not img: raise HTTPException(status_code=404)
@@ -157,7 +172,7 @@ def stop_epaper_slideshow():
     return {"status": "stopped"}
 
 @epaper_router.delete("/epaper/images/{image_id}")
-def delete_epaper_image(image_id: int):
+def delete_epaper_image(image_id: int, db: Session = Depends(get_db)):
     img = db.query(EPaperImageModel).filter(EPaperImageModel.id == image_id).first()
     if img:
         p = os.path.join(UPLOAD_EPAPER_DIR, img.filename)
@@ -169,7 +184,6 @@ def delete_epaper_image(image_id: int):
 async def test_performance():
     """
     Endpoint zero-resource. Nie dotyka bazy, nie dotyka sprzętu.
-    Jeśli to muli, to znaczy że serwer jest zablokowany na poziomie wątków.
     """
     return {
         "status": "ok",
