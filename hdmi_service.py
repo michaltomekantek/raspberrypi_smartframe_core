@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Depends
 from sqlalchemy.orm import Session
 from PIL import Image, ImageDraw
+# Pamiętaj: importujemy SessionLocal i ImageModel z Twojego nowego database.py
 from database import SessionLocal, ImageModel
 
 hdmi_router = APIRouter(tags=["HDMI Control"])
@@ -17,12 +18,14 @@ hdmi_interval = 10
 try:
     import pygame
     pygame.init()
+    # Próba otwarcia okna Pygame (HDMI)
     screen = pygame.display.set_mode((1024, 600), pygame.FULLSCREEN | pygame.NOFRAME)
     pygame.mouse.set_visible(False)
 except:
     screen = None
 
 # --- DEPENDENCY ---
+# To pozwala każdemu zapytaniu o zdjęcia mieć własne połączenie z bazą
 def get_db():
     db = SessionLocal()
     try:
@@ -69,21 +72,31 @@ def show_stats():
 
 @hdmi_router.get("/images")
 def get_images(db: Session = Depends(get_db)):
+    # db jest teraz wstrzykiwane automatycznie przez FastAPI
     return db.query(ImageModel).all()
 
 @hdmi_router.post("/upload")
 async def upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
     content = await file.read()
+    # Tworzymy rekord w bazie danych
     new_img = ImageModel(filename="temp", url="temp")
-    db.add(new_img); db.commit(); db.refresh(new_img)
+    db.add(new_img)
+    db.commit()
+    db.refresh(new_img)
 
     ext = os.path.splitext(file.filename)[1].lower()
     fname = f"{new_img.id}{ext}"
     path = os.path.join(UPLOAD_DIR, fname)
 
-    with open(path, "wb") as f: f.write(content)
+    # Zapisujemy fizyczny plik
+    with open(path, "wb") as f:
+        f.write(content)
+
+    # Aktualizujemy nazwę pliku w bazie
     new_img.filename, new_img.url = fname, f"{BASE_URL}{fname}"
     db.commit()
+
+    # Od razu wyświetlamy na HDMI
     render_hdmi(path)
     return new_img
 
@@ -102,6 +115,8 @@ def delete_image(image_id: int, db: Session = Depends(get_db)):
     img = db.query(ImageModel).filter(ImageModel.id == image_id).first()
     if img:
         p = os.path.join(UPLOAD_DIR, img.filename)
-        if os.path.exists(p): os.remove(p)
-        db.delete(img); db.commit()
+        if os.path.exists(p):
+            os.remove(p)
+        db.delete(img)
+        db.commit()
     return {"status": "deleted"}
